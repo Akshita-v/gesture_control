@@ -102,30 +102,28 @@ Training script flow:
 
 ## Performance Report
 
-(Your provided output)
-
 ```text
 Training started...
 
 --- PERFORMANCE REPORT ---
-Overall Accuracy: 93.18%
+Overall Accuracy: 95.24%
 
 Detailed Breakdown per Gesture:
               precision    recall  f1-score   support
 
-           0       0.93      0.93      0.93        15
-           1       0.92      1.00      0.96        11
-           2       0.89      1.00      0.94         8
+           0       0.88      1.00      0.94        15
+           1       1.00      0.91      0.95        11
+           2       1.00      0.88      0.93         8
            3       1.00      0.80      0.89        10
            4       0.93      1.00      0.97        14
-           5       0.92      1.00      0.96        11
-           6       1.00      0.80      0.89         5
-           7       0.89      0.89      0.89         9
-           8       1.00      0.80      0.89         5
+           5       1.00      1.00      1.00        11
+           6       0.83      1.00      0.91         5
+           7       1.00      1.00      1.00         5
+           8       1.00      1.00      1.00         5
 
-    accuracy                           0.93        88
-   macro avg       0.94      0.91      0.92        88
-weighted avg       0.94      0.93      0.93        88
+    accuracy                           0.95        84
+   macro avg       0.96      0.95      0.95        84
+weighted avg       0.96      0.95      0.95        84
 ```
 
 ---
@@ -142,24 +140,30 @@ Startup message:
 Controls:
 - Press `q` in the OpenCV window to exit.
 
+Camera window size is set to `960x540` (`CAMERA_WIDTH` / `CAMERA_HEIGHT`). Cursor mapping uses `CURSOR_FRAME_MARGIN = 0.20`, meaning only the central 60% of the frame maps to the full screen for easier edge reach.
+
 ---
 
 ## Current Runtime Tuning (False Trigger Protection)
 
-In `mouse_main.py`, app gestures use stricter gating:
+In `mouse_main.py`, app gestures use confidence + hold-frame gating:
 
 - Global app cooldown: `APP_COOLDOWN = 2.0`
-- Per-gesture hold frames:
-  - Gesture `6`: `6`
-  - Gesture `7`: `5`
-  - Gesture `8`: `3`
-- Per-gesture confidence thresholds:
-  - Gesture `6`: `0.80`
-  - Gesture `7`: `0.75`
-  - Gesture `8`: `0.60`
-- Re-arm requirement: at least `2` non-app frames before another app launch is allowed.
+- Per-gesture hold frames (stabilized frames required before launch):
+  - Gesture `6`: `2`
+  - Gesture `7`: `3`
+  - Gesture `8`: `2`
+- Per-gesture minimum confidence (probability of stabilized gesture):
+  - Gesture `6`: `0.78`
+  - Gesture `7`: `0.80`
+  - Gesture `8`: `0.72`
+- Per-gesture minimum confidence margin over second-best class:
+  - Gesture `6`: `0.10`
+  - Gesture `7`: `0.12`
+  - Gesture `8`: `0.08`
+- Re-arm requirement: at least `6` non-app frames before another app launch is allowed.
 
-This helps avoid accidental app opens while transitioning between gestures.
+Confidence is checked against the stabilized gesture's own probability (not the top class), making detection more reliable when the gesture is held steadily.
 
 ---
 
@@ -170,14 +174,20 @@ This helps avoid accidental app opens while transitioning between gestures.
 - Increase hold frames and/or confidence threshold for that gesture in `mouse_main.py`.
 - Improve lighting and keep hand fully visible.
 - Add more training samples for confusing gesture pairs.
+- Add more samples specifically for `6` and `8`; they currently have much lower dataset support than `0`, `4`, and `5`.
 
 ### 2) Cursor feels jittery
 
 - Increase `GESTURE_WINDOW` for more stable gesture voting.
 - Decrease `SMOOTHING` for smoother movement.
 - Increase `CURSOR_DEADZONE` to suppress tiny oscillations.
+- Decrease `CURSOR_FRAME_MARGIN` to reduce cursor sensitivity (currently `0.20`).
 
-### 3) Model predicts some gestures poorly
+### 3) Need too much hand movement to reach screen edges
+
+- Increase `CURSOR_FRAME_MARGIN` (e.g. `0.25` or `0.30`) so only the central portion of the camera maps to the full screen — requiring less hand travel.
+
+### 4) Model predicts some gestures poorly
 
 - Collect more balanced samples for low-support classes (`6`, `8` currently have fewer samples).
 - Ensure gesture shape consistency during collection.
@@ -209,4 +219,4 @@ python mouse_main.py
 
 ## Author Notes
 
-This README reflects the current code behavior in this workspace, including the latest stricter anti-false-trigger handling for gestures `6` and `7`.
+This README reflects the current code behavior in this workspace, including confidence + hold-frame gating for app-launch gestures `6`, `7`, and `8`.

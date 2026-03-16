@@ -16,24 +16,34 @@ ENCODER_PATH = "label_encoder_1.pkl"
 TASK_FILE = "hand_landmarker.task"
 
 pyautogui.FAILSAFE = False
-SMOOTHING = 0.19            # Lower = smoother cursor movement
-CURSOR_DEADZONE = 3         # Slightly higher to suppress micro-jitter
+SMOOTHING = 0.16            # Higher = less smoothing, lower = smoother cursor movement
+CURSOR_DEADZONE = 10        # Ignore tiny hand shifts before moving the cursor
+CURSOR_FRAME_MARGIN = 0.20  # Smaller active zone = less hand movement needed to reach screen edges
 GESTURE_WINDOW = 6          # More frames = steadier gesture stabilization
 SCROLL_COOLDOWN = 0.12      # Seconds between scroll events
 APP_COOLDOWN = 2.0          # Seconds before the same app can be launched again
-APP_CONFIDENCE_THRESHOLD = 0.60
-APP_HOLD_FRAMES = 3
+CAMERA_WIDTH = 960
+CAMERA_HEIGHT = 540
+WINDOW_NAME = "Hand-Gesture Mouse Controller"
+WINDOW_WIDTH = 960
+WINDOW_HEIGHT = 540
+APP_HOLD_FRAMES = 3         # Require same app gesture for N stabilized frames
+APP_MIN_CONFIDENCE_MAP = {
+    "6": 0.78,
+    "7": 0.80,
+    "8": 0.72,
+}
+APP_MIN_MARGIN_MAP = {
+    "6": 0.10,
+    "7": 0.12,
+    "8": 0.08,
+}
 APP_HOLD_FRAMES_MAP = {
-    "6": 6,
-    "7": 5,
-    "8": 3,
+    "6": 2,
+    "7": 3,
+    "8": 2,
 }
-APP_CONFIDENCE_THRESHOLD_MAP = {
-    "6": 0.80,
-    "7": 0.75,
-    "8": 0.60,
-}
-APP_REARM_NON_APP_FRAMES = 2
+APP_REARM_NON_APP_FRAMES = 6
 CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -43,6 +53,7 @@ CHROME_PATHS = [
 # --- 2. INITIALIZE AI & TOOLS ---
 model = joblib.load(MODEL_PATH)
 encoder = joblib.load(ENCODER_PATH)
+CLASS_INDEX_MAP = {str(label).strip(): idx for idx, label in enumerate(encoder.classes_)}
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -80,20 +91,30 @@ def launch_chrome(url=None):
             webbrowser.open("https://www.google.com")
 
 def launch_calculator():
+    # Try UWP protocol (most reliable on Windows 10/11)
     try:
-        subprocess.Popen(["calc.exe"])
+        os.startfile("calculator:")
         return
-    except OSError:
+    except Exception as e:
+        pass
+
+    # Fallback: calc.exe via cmd
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "calc"])
+        return
+    except Exception as e:
         pass
 
     try:
-        subprocess.Popen("start calc", shell=True)
-    except OSError:
+        subprocess.Popen(["calc.exe"])
+    except Exception as e:
         pass
 
 def launch_youtube():
-    launch_chrome("https://www.youtube.com")
-
+    try:
+       os.startfile("https://www.youtube.com")
+    except OSError:
+            webbrowser.open("https://www.youtube.com")
 def draw_hand_landmarks(frame, landmarks):
     h, w, _ = frame.shape
 
@@ -162,6 +183,10 @@ def draw_horizontal_legend(frame, active_gesture):
 
 # --- 3. SYSTEM STATE ---
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
 sw, sh = pyautogui.size()
 is_active = False
 last_scroll_time = 0
@@ -170,11 +195,11 @@ smooth_x = None
 smooth_y = None
 gesture_history = deque(maxlen=GESTURE_WINDOW)
 prev_gesture = None
-app_hold_gesture = None
-app_hold_count = 0
 app_ready_prev = False
 app_non_gesture_count = 0
 app_armed = True
+app_hold_gesture = None
+app_hold_count = 0
 
 GESTURE_LABELS = {
     "0": "Palm -> Activate",
@@ -210,7 +235,8 @@ while cap.isOpened():
         probs = model.predict_proba(feat)[0]
         max_prob_idx = int(np.argmax(probs))
         max_prob = float(probs[max_prob_idx])
-        prob_gesture = str(encoder.inverse_transform([max_prob_idx])[0]).strip()
+        sorted_prob_indices = np.argsort(probs)
+        second_prob = float(probs[sorted_prob_indices[-2]]) if len(sorted_prob_indices) > 1 else 0.0
         pred = model.predict(feat)
         raw_gesture = str(encoder.inverse_transform(pred)[0]).strip()
 
@@ -220,8 +246,10 @@ while cap.isOpened():
 
         # B. TRACKING (Index Tip = Landmark 8)
         itip = lms[8]
-        target_x = np.interp(itip.x, [0.2, 0.8], [0, sw])
-        target_y = np.interp(itip.y, [0.2, 0.8], [0, sh])
+        clipped_x = np.clip(itip.x, CURSOR_FRAME_MARGIN, 1 - CURSOR_FRAME_MARGIN)
+        clipped_y = np.clip(itip.y, CURSOR_FRAME_MARGIN, 1 - CURSOR_FRAME_MARGIN)
+        target_x = np.interp(clipped_x, [CURSOR_FRAME_MARGIN, 1 - CURSOR_FRAME_MARGIN], [0, sw])
+        target_y = np.interp(clipped_y, [CURSOR_FRAME_MARGIN, 1 - CURSOR_FRAME_MARGIN], [0, sh])
 
         # C. ACTIVATION LOGIC
         if gesture == "0":   # OPEN PALM
@@ -265,12 +293,23 @@ while cap.isOpened():
             smooth_x, smooth_y = None, None
             cv2.putText(frame, "STATUS: PAUSED (Show Palm)", (10, 40), 1, 1.3, (0, 0, 255), 2)
 
-        # 4. APP LAUNCHER (IDs 6/7/8, stricter hold + confidence + re-arm)
+        # 4. APP LAUNCHER (IDs 6/7/8, based on stabilized gesture)
         app_candidate = None
         if gesture in {"6", "7", "8"}:
-            app_candidate = gesture
-        elif prob_gesture in {"6", "7", "8"} and max_prob >= APP_CONFIDENCE_THRESHOLD_MAP.get(prob_gesture, APP_CONFIDENCE_THRESHOLD):
-            app_candidate = prob_gesture
+            gesture_idx = CLASS_INDEX_MAP.get(gesture)
+            if gesture_idx is not None:
+                gesture_prob = float(probs[gesture_idx])
+                confidence_margin = gesture_prob - second_prob
+                min_conf = APP_MIN_CONFIDENCE_MAP.get(gesture, 0.75)
+                min_margin = APP_MIN_MARGIN_MAP.get(gesture, 0.08)
+                if gesture_prob >= min_conf and confidence_margin >= min_margin:
+                    app_candidate = gesture
+
+        if app_candidate == app_hold_gesture:
+            app_hold_count += 1
+        else:
+            app_hold_gesture = app_candidate
+            app_hold_count = 1 if app_candidate else 0
 
         if app_candidate is None:
             app_non_gesture_count += 1
@@ -279,28 +318,19 @@ while cap.isOpened():
         else:
             app_non_gesture_count = 0
 
-        if app_candidate is None:
-            app_hold_gesture = None
-            app_hold_count = 0
-        elif app_hold_gesture == app_candidate:
-            app_hold_count += 1
-        else:
-            app_hold_gesture = app_candidate
-            app_hold_count = 1
-
-        hold_needed = APP_HOLD_FRAMES_MAP.get(app_hold_gesture, APP_HOLD_FRAMES)
-        app_ready = app_hold_count >= hold_needed
+        hold_required = APP_HOLD_FRAMES_MAP.get(app_candidate, APP_HOLD_FRAMES) if app_candidate else APP_HOLD_FRAMES
+        app_ready = app_candidate is not None and app_hold_count >= hold_required
         now = time.time()
         if app_ready and not app_ready_prev and app_armed and now - last_app_time > APP_COOLDOWN:
-            if app_hold_gesture == "6":   # Calculator
+            if app_candidate == "6":   # Calculator
                 launch_calculator()
                 last_app_time = now
                 app_armed = False
-            elif app_hold_gesture == "7": # Chrome
+            elif app_candidate == "7": # Chrome
                 launch_chrome()
                 last_app_time = now
                 app_armed = False
-            elif app_hold_gesture == "8": # YouTube
+            elif app_candidate == "8": # YouTube
                 launch_youtube()
                 last_app_time = now
                 app_armed = False
@@ -316,13 +346,13 @@ while cap.isOpened():
 
     else:
         smooth_x, smooth_y = None, None
-        app_hold_gesture = None
-        app_hold_count = 0
         app_ready_prev = False
         app_non_gesture_count = 0
         app_armed = True
+        app_hold_gesture = None
+        app_hold_count = 0
 
-    cv2.imshow("Hand-Gesture Mouse Controller", frame)
+    cv2.imshow(WINDOW_NAME, frame)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 detector.close()
